@@ -29,7 +29,7 @@ from erpnext.accounts.report.bank_reconciliation_statement.bank_reconciliation_s
 	get_amounts_not_reflected_in_system,
 	get_entries,
 )
-from erpnext.accounts.utils import get_account_currency, get_balance_on
+from erpnext.accounts.utils import get_account_currency, get_balance_on, get_currency_precision
 from erpnext.setup.utils import get_exchange_rate
 
 
@@ -1332,7 +1332,31 @@ def _get_linked_payments(
 		from_reference_date,
 		to_reference_date,
 	)
-	return subtract_allocations(gl_account, matching)
+	vouchers = subtract_allocations(gl_account, matching)
+	return rerank_by_remaining_amount(vouchers, transaction)
+
+
+AMOUNT_MATCH_WEIGHT = 2
+
+
+def rerank_by_remaining_amount(vouchers, transaction):
+	"""Re-score the amount match on the *remaining* (unallocated) voucher amount, weighted.
+
+	The SQL amount_rank (0/1) compares the voucher's full amount, so a partially allocated voucher
+	whose remaining amount equals the transaction's unallocated amount (2nd half of a split) gets 0.
+	Here (after subtract_allocations, so paid_amount is the remainder) we swap that SQL term for
+	AMOUNT_MATCH_WEIGHT when the remainder matches. Amount outweighs any single other factor, but
+	ref/party/date still add, so recurring same-amount vouchers are still ordered by them.
+	"""
+	if not vouchers:
+		return vouchers
+	precision = get_currency_precision() or 2
+	target = flt(transaction.unallocated_amount, precision)
+	for voucher in vouchers:
+		amount_rank = AMOUNT_MATCH_WEIGHT if flt(voucher.get("paid_amount"), precision) == target else 0
+		voucher["rank"] = flt(voucher.get("rank")) - flt(voucher.get("amount_rank")) + amount_rank
+		voucher["amount_rank"] = amount_rank
+	return sorted(vouchers, key=lambda v: flt(v.get("rank")), reverse=True)
 
 
 def get_writable_linked_vouchers(vouchers: list) -> list:
@@ -1565,6 +1589,7 @@ def get_bt_matching_query(exact_match, transaction):
 		frappe.qb.from_(bt)
 		.select(
 			(ref_rank + amount_rank + party_rank + unallocated_rank + 1).as_("rank"),
+			amount_rank.as_("amount_rank"),
 			ConstantColumn("Bank Transaction").as_("doctype"),
 			bt.name,
 			bt.unallocated_amount.as_("paid_amount"),
@@ -1623,6 +1648,7 @@ def get_pe_matching_query(
 		frappe.qb.from_(pe)
 		.select(
 			(ref_rank + amount_rank + party_rank + 1).as_("rank"),
+			amount_rank.as_("amount_rank"),
 			ConstantColumn("Payment Entry").as_("doctype"),
 			pe.name,
 			amount_field.as_("paid_amount"),
@@ -1708,6 +1734,7 @@ def get_je_matching_query(
 		.select(
 			"*",
 			(ref_rank + amount_rank + 1).as_("rank"),
+			amount_rank.as_("amount_rank"),
 		)
 		.where(amount_equality if exact_match else subquery.paid_amount > 0.0)
 	)
@@ -1736,6 +1763,7 @@ def get_si_matching_query(exact_match, currency, common_filters, transaction):
 		.on(sip.parent == si.name)
 		.select(
 			(ref_rank + party_rank + amount_rank + 1).as_("rank"),
+			amount_rank.as_("amount_rank"),
 			ConstantColumn("Sales Invoice").as_("doctype"),
 			si.name,
 			sip.amount.as_("paid_amount"),
@@ -1774,6 +1802,7 @@ def get_pi_matching_query(exact_match, currency, common_filters):
 		frappe.qb.from_(purchase_invoice)
 		.select(
 			(party_rank + amount_rank + 1).as_("rank"),
+			amount_rank.as_("amount_rank"),
 			ConstantColumn("Purchase Invoice").as_("doctype"),
 			purchase_invoice.name,
 			purchase_invoice.paid_amount,
