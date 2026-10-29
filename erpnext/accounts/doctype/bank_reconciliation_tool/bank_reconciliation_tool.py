@@ -1409,7 +1409,27 @@ def check_matching(
 	for query in queries:
 		matching_vouchers.extend(query.run(as_dict=True))
 
+	add_date_proximity_rank(matching_vouchers, transaction.date)
 	return sorted(matching_vouchers, key=lambda x: x["rank"], reverse=True) if matching_vouchers else []
+
+
+DATE_PROXIMITY_WINDOW_DAYS = 30
+
+
+def add_date_proximity_rank(vouchers, transaction_date):
+	"""Add a 0..1 score to rank: 1 for same day, linearly down to 0 at DATE_PROXIMITY_WINDOW_DAYS apart.
+	Uses the closer of posting_date / reference_date."""
+	if not transaction_date:
+		return
+	txn_date = getdate(transaction_date)
+	for voucher in vouchers:
+		days = [
+			abs((getdate(voucher.get(f)) - txn_date).days)
+			for f in ("posting_date", "reference_date")
+			if voucher.get(f)
+		]
+		score = max(0.0, 1 - min(days) / DATE_PROXIMITY_WINDOW_DAYS) if days else 0.0
+		voucher["rank"] = flt(voucher.get("rank")) + score
 
 
 def get_queries(
